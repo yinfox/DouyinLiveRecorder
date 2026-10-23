@@ -5076,6 +5076,8 @@ while True:
             with webui_status_lock:
                 if removed_url not in url_comments:
                     url_comments.append(removed_url)
+                if removed_url in running_list:
+                    running_list.remove(removed_url)
             update_webui_room_status(removed_url, status="stopped", message="配置已移除，停止监控")
 
         with room_dispatch_lock:
@@ -5094,6 +5096,10 @@ while True:
                     if url_tuple[1] in running_list:
                         with room_dispatch_lock:
                             room_monitor_configs[url_tuple[1]] = url_tuple
+                            if (url_tuple[1] not in room_worker_threads
+                                    and url_tuple[1] not in room_next_check_monotonic):
+                                room_next_check_monotonic[url_tuple[1]] = time.monotonic()
+                        room_dispatch_event.set()
                         continue
                     monitoring = len(running_list) + 1
                     running_list.append(url_tuple[1])
