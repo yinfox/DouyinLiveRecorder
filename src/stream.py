@@ -24,6 +24,14 @@ from .spider import (
 from .http_clients.async_http import get_response_status
 
 QUALITY_MAPPING = {"OD": 0, "BD": 0, "UHD": 1, "HD": 2, "SD": 3, "LD": 4}
+AVATAR_KEYS = (
+    "avatar_url", "avatarUrl", "avatar", "avatar_thumb", "avatarThumb",
+    "avatar_medium", "avatarMedium", "avatar_larger", "avatarLarger",
+    "head_img", "headImg", "headimg", "headImage", "profile_image_url",
+    "profileImageUrl", "profilePictureUrl", "profilePicture", "portrait",
+    "portraitUrl", "photo", "photoUrl", "face", "face_url", "pic",
+)
+URL_KEYS = ("url_list", "urlList", "urls", "url", "uri")
 
 
 def get_quality_index(quality) -> tuple:
@@ -37,13 +45,66 @@ def get_quality_index(quality) -> tuple:
     return quality_str, QUALITY_MAPPING.get(quality_str, 0)
 
 
+def _first_http_url(value, depth: int = 0) -> str:
+    if depth > 6:
+        return ""
+    if isinstance(value, str):
+        url = value.strip()
+        if url.startswith("//"):
+            return f"https:{url}"
+        if url.startswith(("http://", "https://")):
+            return url
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            url = _first_http_url(item, depth + 1)
+            if url:
+                return url
+        return ""
+    if isinstance(value, dict):
+        for key in URL_KEYS:
+            if key in value:
+                url = _first_http_url(value[key], depth + 1)
+                if url:
+                    return url
+        return ""
+    return ""
+
+
+def extract_avatar_url(*sources, depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    for source in sources:
+        if isinstance(source, dict):
+            for key in AVATAR_KEYS:
+                if key in source:
+                    url = _first_http_url(source[key])
+                    if url:
+                        return url
+            for value in source.values():
+                if isinstance(value, (dict, list)):
+                    url = extract_avatar_url(value, depth=depth + 1)
+                    if url:
+                        return url
+        elif isinstance(source, list):
+            for item in source:
+                url = extract_avatar_url(item, depth=depth + 1)
+                if url:
+                    return url
+    return ""
+
+
 @trace_error_decorator
 async def get_douyin_stream_url(json_data: dict, video_quality: str, proxy_addr: str) -> dict:
     anchor_name = json_data.get('anchor_name')
+    room_id = str(json_data.get('id_str') or json_data.get('id') or '')
+    avatar_url = extract_avatar_url(json_data.get("owner"), json_data.get("user"), json_data)
 
     result = {
         "anchor_name": anchor_name,
+        "avatar_url": avatar_url,
         "is_live": False,
+        "room_id": room_id,
     }
 
     status = json_data.get("status", 4)
@@ -112,9 +173,11 @@ async def get_tiktok_stream_url(json_data: dict, video_quality: str, proxy_addr:
     user = live_room['user']
     anchor_name = f"{user['nickname']}-{user['uniqueId']}"
     status = user.get("status", 4)
+    avatar_url = extract_avatar_url(user, live_room)
 
     result = {
         "anchor_name": anchor_name,
+        "avatar_url": avatar_url,
         "is_live": False,
     }
 
@@ -158,10 +221,12 @@ async def get_kuaishou_stream_url(json_data: dict, video_quality: str) -> dict:
     if json_data['type'] == 1 and not json_data["is_live"]:
         return json_data
     live_status = json_data['is_live']
+    avatar_url = extract_avatar_url(json_data)
 
     result = {
         "type": 2,
         "anchor_name": json_data['anchor_name'],
+        "avatar_url": avatar_url,
         "is_live": live_status,
     }
 
@@ -420,6 +485,7 @@ async def get_stream_url(json_data: dict, video_quality: str, url_type: str = 'm
     video_quality, selected_quality = get_quality_index(video_quality)
     data = {
         "anchor_name": json_data['anchor_name'],
+        "avatar_url": extract_avatar_url(json_data),
         "is_live": True
     }
 

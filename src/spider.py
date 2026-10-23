@@ -10,6 +10,7 @@ Function: Get live stream data.
 """
 
 import hashlib
+import html
 import random
 import subprocess
 import time
@@ -37,6 +38,8 @@ ssl_context.check_hostname = False
 ssl_context.verify_mode = ssl.CERT_NONE
 OptionalStr = str | None
 OptionalDict = dict | None
+# xHamsterLive's player appends this token only for NativeStreamURL candidates.
+XHAMSTERLIVE_NATIVE_HLS_PKEY = "L1CwcHKcByAh63eb"
 
 
 def get_params(url: str, params: str) -> OptionalStr:
@@ -56,12 +59,13 @@ async def get_play_url_list(m3u8: str, proxy: OptionalStr = None, header: Option
             play_url_list.append(i.strip())
     if not play_url_list:
         for i in resp.split('\n'):
-            if i.strip().endswith('m3u8'):
-                play_url_list.append(i.strip())
+            play_url = i.strip()
+            if play_url and not play_url.startswith('#') and '.m3u8' in play_url:
+                play_url_list.append(play_url)
     bandwidth_pattern = re.compile(r'BANDWIDTH=(\d+)')
     bandwidth_list = bandwidth_pattern.findall(resp)
     url_to_bandwidth = {url: int(bandwidth) for bandwidth, url in zip(bandwidth_list, play_url_list)}
-    play_url_list = sorted(play_url_list, key=lambda url: url_to_bandwidth[url], reverse=True)
+    play_url_list = sorted(play_url_list, key=lambda url: url_to_bandwidth.get(url, 0), reverse=True)
     return play_url_list
 
 
@@ -345,8 +349,10 @@ async def get_kuaishou_stream_data(url: str, proxy_addr: OptionalStr = None, coo
         print("IP banned. Please change device or network.")
         return result
 
-    anchor_name = play_list['author'].get('name', '')
-    result.update({"anchor_name": anchor_name})
+    author = play_list['author']
+    anchor_name = author.get('name', '')
+    avatar_url = author.get('avatar') or author.get('headUrl') or author.get('headurl') or ''
+    result.update({"anchor_name": anchor_name, "avatar_url": avatar_url})
 
     if play_list['liveStream'].get("playUrls"):
         if 'h264' in play_list['liveStream']['playUrls']:
@@ -380,9 +386,12 @@ async def get_kuaishou_stream_data2(url: str, proxy_addr: OptionalStr = None, co
         json_data = json.loads(json_str)
         live_stream = json_data['liveStream']
         anchor_name = live_stream['user']['user_name']
+        user = live_stream['user']
+        avatar_url = user.get('avatar') or user.get('headUrl') or user.get('headurl') or ''
         result = {
             "type": 2,
             "anchor_name": anchor_name,
+            "avatar_url": avatar_url,
             "is_live": False,
         }
         live_status = live_stream['living']
@@ -3022,6 +3031,446 @@ async def get_youtube_stream_url(url: str, proxy_addr: OptionalStr = None, cooki
         m3u8_url = json_data['streamingData']["hlsManifestUrl"]
         play_url_list = await get_play_url_list(m3u8_url, proxy=proxy_addr, header=headers, abroad=True)
         result |= {"is_live": True, "title": live_title, "m3u8_url": m3u8_url, "play_url_list": play_url_list}
+    return result
+
+
+def extract_page_m3u8_urls(text: str) -> list[str]:
+    normalized_text = html.unescape(str(text or ""))
+    replacements = {
+        "\\/": "/",
+        "\\u002F": "/",
+        "\\u002f": "/",
+        "\\u003A": ":",
+        "\\u003a": ":",
+        "\\u003F": "?",
+        "\\u003f": "?",
+        "\\u003D": "=",
+        "\\u003d": "=",
+        "\\u0026": "&",
+    }
+    for old, new in replacements.items():
+        normalized_text = normalized_text.replace(old, new)
+
+    candidates = []
+    for pattern in (
+            r"https?://[^\"'<>\s]+?\.m3u8[^\"'<>\s]*",
+            r"//[^\"'<>\s]+?\.m3u8[^\"'<>\s]*",
+    ):
+        candidates.extend(re.findall(pattern, normalized_text, flags=re.IGNORECASE))
+
+    urls = []
+    for candidate in candidates:
+        stream_url = candidate.strip().rstrip("\\,;)")
+        if stream_url.startswith("//"):
+            stream_url = "https:" + stream_url
+        if "{" in stream_url or "}" in stream_url:
+            continue
+        if stream_url not in urls:
+            urls.append(stream_url)
+    return urls
+
+
+def extract_xhamsterlive_preloaded_state(text: str) -> dict:
+    match = re.search(
+        r"window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*</script>",
+        str(text or ""),
+        flags=re.DOTALL,
+    )
+    if not match:
+        return {}
+
+    try:
+        return json.loads(html.unescape(match.group(1)))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def nested_get(data: dict, *keys: str):
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def normalize_xhamsterlive_image_url(url: str | None) -> str:
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("/"):
+        return urllib.parse.urljoin("https://zh.xhamsterlive.com", url)
+    if url.startswith(("http://", "https://")):
+        return url
+    return ""
+
+
+def extract_xhamsterlive_avatar_url(*sources) -> str:
+    avatar_keys = (
+        "avatarUrlThumb",
+        "avatarUrl",
+        "avatarUrlOriginal",
+        "avatar_url",
+        "avatar",
+        "avatarThumb",
+        "avatar_thumb",
+        "profilePictureUrl",
+        "profileImageUrl",
+        "portraitUrl",
+        "photoUrl",
+    )
+
+    def walk(source, depth: int = 0) -> str:
+        if depth > 5:
+            return ""
+        if isinstance(source, dict):
+            for key in avatar_keys:
+                url = normalize_xhamsterlive_image_url(source.get(key))
+                if url:
+                    return url
+            for value in source.values():
+                if isinstance(value, (dict, list)):
+                    url = walk(value, depth + 1)
+                    if url:
+                        return url
+        elif isinstance(source, list):
+            for item in source:
+                url = walk(item, depth + 1)
+                if url:
+                    return url
+        return ""
+
+    for source in sources:
+        url = walk(source)
+        if url:
+            return url
+    return ""
+
+
+def append_url_params(url: str, params: dict) -> str:
+    clean_params = {key: value for key, value in params.items() if value not in (None, "")}
+    if not clean_params:
+        return url
+
+    parsed_url = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True)
+    query_params.extend((key, str(value)) for key, value in clean_params.items())
+    return urllib.parse.urlunparse(parsed_url._replace(query=urllib.parse.urlencode(query_params)))
+
+
+def build_xhamsterlive_hls_urls(
+        state: dict,
+        stream_name: OptionalStr = None,
+        acl_auth: OptionalStr = None,
+) -> list[str]:
+    initial_common = nested_get(state, "configV3", "initialCommon") or {}
+    template = initial_common.get("hlsStreamUrlTemplate") or (
+        "https://edge-hls.{cdnHost}/hls/{streamName}/master/{streamName}{suffix}.m3u8"
+    )
+    stream_name = stream_name or (
+            nested_get(state, "viewCamBase", "model", "streamName")
+            or nested_get(state, "viewCam", "streamName")
+            or nested_get(state, "viewCam", "model", "streamName")
+    )
+    if not stream_name:
+        return []
+
+    available_hosts = []
+
+    def add_host(host: str | None) -> None:
+        if host and host not in available_hosts:
+            available_hosts.append(host)
+
+    default_hls_host = initial_common.get("defaultHlsStreamHost") or initial_common.get("hlsStreamHost")
+    add_host(default_hls_host)
+    for host in (initial_common.get("hlsStreamHosts") or {}).values():
+        add_host(host)
+    for known_host in ("doppiocdn.com", "doppiocdn.net", "doppiocdn.org", "doppiocdn.media", "doppiocdn.live"):
+        add_host(known_host)
+
+    cdn_hosts = []
+
+    def prefer_host(host: str | None) -> None:
+        if host and host in available_hosts and host not in cdn_hosts:
+            cdn_hosts.append(host)
+
+    for host in ("doppiocdn.org", "doppiocdn.net", "doppiocdn.media", default_hls_host):
+        prefer_host(host)
+    for host in available_hosts:
+        prefer_host(host)
+
+    presets = nested_get(state, "viewCamBase", "broadcastSettings", "presets") or []
+    suffixes = ["_auto", ""]
+    for preset in presets:
+        if not preset:
+            continue
+        preset_text = str(preset)
+        for suffix in (f"_{preset_text.lstrip('_')}", preset_text):
+            if suffix not in suffixes:
+                suffixes.append(suffix)
+    for suffix in ("_480p", "_240p", "_160p", "_160p_blurred", "160p_blurred"):
+        if suffix not in suffixes:
+            suffixes.append(suffix)
+
+    native_params = {
+        "playlistType": "standard",
+        "pkey": XHAMSTERLIVE_NATIVE_HLS_PKEY,
+        "aclAuth": acl_auth,
+    }
+    hls_params = {"playlistType": "standard", "preferredVideoCodec": "h264", "aclAuth": acl_auth}
+    urls = []
+    for cdn_host in cdn_hosts:
+        for suffix in suffixes:
+            stream_url = template
+            values = {
+                "serverName": "edge-hls",
+                "cdnHost": cdn_host,
+                "streamName": stream_name,
+                "suffix": suffix,
+            }
+            for key, value in values.items():
+                stream_url = stream_url.replace("{" + key + "}", str(value))
+            for params in (native_params, hls_params):
+                stream_url_with_params = append_url_params(stream_url, params)
+                if stream_url_with_params not in urls:
+                    urls.append(stream_url_with_params)
+    return urls
+
+
+def parse_xhamsterlive_variant_urls(master_url: str, playlist_text: str) -> list[str]:
+    variants = []
+    pending_bandwidth = 0
+    for line in str(playlist_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-STREAM-INF"):
+            bandwidth = re.search(r"BANDWIDTH=(\d+)", line)
+            pending_bandwidth = int(bandwidth.group(1)) if bandwidth else 0
+            continue
+        if line.startswith("#"):
+            continue
+        if ".m3u8" not in line:
+            continue
+        variants.append((urllib.parse.urljoin(master_url, line), pending_bandwidth))
+        pending_bandwidth = 0
+
+    urls = []
+    for variant_url, _ in sorted(variants, key=itemgetter(1), reverse=True):
+        if variant_url not in urls:
+            urls.append(variant_url)
+    return urls
+
+
+def is_xhamsterlive_ad_or_vod_playlist(playlist_text: str) -> bool:
+    playlist_text = str(playlist_text or "")
+    upper_text = playlist_text.upper()
+    if "#EXT-X-MOUFLON-ADVERT" in upper_text:
+        return True
+    return (
+            "#EXT-X-PLAYLIST-TYPE:VOD" in upper_text
+            and "#EXT-X-ENDLIST" in upper_text
+            and "/cpa/" in playlist_text
+    )
+
+
+async def fetch_xhamsterlive_hls_stream(
+        urls: list[str],
+        proxy_addr: OptionalStr,
+        headers: OptionalDict,
+) -> tuple[str | None, list[str], str]:
+    last_message = ""
+    for stream_url in urls:
+        resp = await async_req(
+            url=stream_url,
+            proxy_addr=proxy_addr,
+            headers=headers,
+            abroad=True,
+            verify=False,
+            http2=False,
+            timeout=8,
+        )
+        resp_text = str(resp or "")
+        if not resp_text.lstrip().startswith("#EXTM3U"):
+            continue
+        if is_xhamsterlive_ad_or_vod_playlist(resp_text):
+            last_message = "解析到广告流，已跳过"
+            continue
+
+        variant_urls = parse_xhamsterlive_variant_urls(stream_url, resp_text)
+        if not variant_urls:
+            return stream_url, [stream_url], ""
+
+        valid_variant_urls = []
+        has_ad_variant = False
+        for variant_url in variant_urls:
+            variant_resp = await async_req(
+                url=variant_url,
+                proxy_addr=proxy_addr,
+                headers=headers,
+                abroad=True,
+                verify=False,
+                http2=False,
+                timeout=8,
+            )
+            variant_text = str(variant_resp or "")
+            if not variant_text.lstrip().startswith("#EXTM3U"):
+                continue
+            if is_xhamsterlive_ad_or_vod_playlist(variant_text):
+                has_ad_variant = True
+                last_message = "解析到广告流，已跳过"
+                continue
+            if variant_url not in valid_variant_urls:
+                valid_variant_urls.append(variant_url)
+
+        if valid_variant_urls:
+            return stream_url, valid_variant_urls, ""
+        if has_ad_variant:
+            continue
+
+    return None, [], last_message or "未获取到真实直播流"
+
+
+async def get_xhamsterlive_cam_data(
+        page_url: str,
+        anchor_name: str,
+        proxy_addr: OptionalStr,
+        headers: OptionalDict,
+) -> dict:
+    parsed_url = urllib.parse.urlparse(page_url)
+    api_url = urllib.parse.urlunparse((
+        parsed_url.scheme or "https",
+        parsed_url.netloc,
+        f"/api/front/v2/models/username/{urllib.parse.quote(anchor_name)}/cam",
+        "",
+        urllib.parse.urlencode({
+            "timezoneOffset": "0",
+            "triggerRequest": "loadCam",
+            "withRecentShow": "1",
+        }),
+        "",
+    ))
+    api_headers = {**(headers or {}), "Accept": "application/json", "Referer": page_url}
+    resp = await async_req(
+        url=api_url,
+        proxy_addr=proxy_addr,
+        headers=api_headers,
+        abroad=True,
+        verify=False,
+        http2=False,
+        timeout=15,
+    )
+    try:
+        return json.loads(str(resp or ""))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+@trace_error_decorator
+async def get_xhamsterlive_stream_url(url: str, proxy_addr: OptionalStr = None, cookies: OptionalStr = None) -> dict:
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': 'https://zh.xhamsterlive.com/',
+        'Upgrade-Insecure-Requests': '1',
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        ),
+    }
+    if cookies:
+        headers['Cookie'] = cookies
+
+    parsed_url = urllib.parse.urlparse(url)
+    anchor_name = parsed_url.path.strip('/').split('/')[0] or parsed_url.netloc
+    result = {"anchor_name": anchor_name, "is_live": False}
+
+    html_str = await async_req(
+        url=url,
+        proxy_addr=proxy_addr,
+        headers=headers,
+        abroad=True,
+        verify=False,
+        http2=False,
+    )
+
+    html_text = str(html_str or "")
+    state = extract_xhamsterlive_preloaded_state(html_text)
+    model = nested_get(state, "viewCamBase", "model") or nested_get(state, "viewCam", "model") or {}
+    avatar_url = extract_xhamsterlive_avatar_url(
+        model,
+        nested_get(state, "viewCam", "model"),
+        nested_get(state, "viewCamBase", "model"),
+    )
+    if avatar_url:
+        result["avatar_url"] = avatar_url
+    anchor_name = (
+            model.get("username")
+            or nested_get(state, "viewCam", "modelUsername")
+            or nested_get(state, "viewCam", "username")
+            or anchor_name
+    )
+    result["anchor_name"] = anchor_name
+
+    cam_data = await get_xhamsterlive_cam_data(url, anchor_name, proxy_addr, headers)
+    cam_info = cam_data.get("cam") or {}
+    user_info = nested_get(cam_data, "user", "user") or {}
+    if user_info.get("username"):
+        anchor_name = user_info["username"]
+        result["anchor_name"] = anchor_name
+    avatar_url = extract_xhamsterlive_avatar_url(user_info, cam_info, model) or result.get("avatar_url", "")
+    if avatar_url:
+        result["avatar_url"] = avatar_url
+
+    stream_name = str(cam_info.get("streamName") or "").strip()
+    acl_auth = cam_info.get("userToken") or cam_info.get("modelToken")
+    if cam_data:
+        is_live = bool(cam_info.get("isCamAvailable")) and bool(stream_name)
+        user_is_live = bool(user_info.get("isLive")) or user_info.get("status") == "public"
+        if not is_live:
+            result["message"] = "直播不可用" if user_is_live else "未开播"
+            return result
+    else:
+        stream_name = (
+                str(model.get("streamName") or "").strip()
+                or str(nested_get(state, "viewCam", "streamName") or "").strip()
+        )
+        is_live = bool(model.get("isLive")) or model.get("status") == "public" or nested_get(
+            state, "viewCam", "status"
+        ) == "public"
+        if state and not is_live:
+            result["message"] = "未开播"
+            return result
+
+    hls_headers = {
+        **headers,
+        'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*',
+        'Origin': 'https://zh.xhamsterlive.com',
+    }
+
+    m3u8_urls = build_xhamsterlive_hls_urls(state, stream_name=stream_name, acl_auth=acl_auth)
+    for page_m3u8_url in extract_page_m3u8_urls(html_text):
+        if page_m3u8_url not in m3u8_urls:
+            m3u8_urls.append(page_m3u8_url)
+    if not m3u8_urls:
+        result["message"] = "未获取到页面直播数据"
+        return result
+
+    m3u8_url, play_url_list, stream_message = await fetch_xhamsterlive_hls_stream(m3u8_urls, proxy_addr, hls_headers)
+    if not m3u8_url:
+        result["message"] = stream_message or ("已开播但未解析到HLS地址" if is_live else "等待直播")
+        return result
+
+    result |= {
+        "is_live": True,
+        "m3u8_url": m3u8_url,
+        "play_url_list": play_url_list,
+        "record_url": play_url_list[0] if play_url_list else m3u8_url,
+    }
     return result
 
 

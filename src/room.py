@@ -9,6 +9,7 @@ Copyright (c) 2023 by Hmily, All Rights Reserved.
 """
 import re
 import urllib.parse
+import json
 import execjs
 import httpx
 import urllib.request
@@ -38,6 +39,68 @@ HEADERS_PC = {
     }
 
 
+def _first_query_value(query_params: dict[str, list[str]], key: str) -> str:
+    values = query_params.get(key) or []
+    return values[0] if values else ""
+
+
+def _nested_json_values(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield item
+            yield from _nested_json_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield item
+            yield from _nested_json_values(item)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                yield from _nested_json_values(json.loads(stripped))
+            except json.JSONDecodeError:
+                return
+
+
+def _nested_json_value(value: str, key: str) -> str:
+    if not value:
+        return ""
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return ""
+    if isinstance(data, dict) and data.get(key):
+        return str(data[key])
+    for item in _nested_json_values(data):
+        if isinstance(item, dict) and item.get(key):
+            return str(item[key])
+    return ""
+
+
+def _extract_reflow_params(url: str) -> tuple[str, str]:
+    parsed_url = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qs(parsed_url.query)
+
+    room_id = _first_query_value(query_params, "room_id")
+    room_match = re.search(r"/reflow/([^/?#]+)", parsed_url.path)
+    if room_match:
+        room_id = room_match.group(1)
+
+    sec_user_id = (
+        _first_query_value(query_params, "sec_user_id")
+        or _first_query_value(query_params, "sec_uid")
+        or _first_query_value(query_params, "sec_relation_user_id")
+    )
+
+    extra_params = _first_query_value(query_params, "extra_params")
+    if extra_params:
+        room_id = room_id or _nested_json_value(extra_params, "room_id")
+        sec_user_id = sec_user_id or _nested_json_value(extra_params, "sec_user_id")
+        sec_user_id = sec_user_id or _nested_json_value(extra_params, "sec_relation_user_id")
+
+    return room_id, sec_user_id
+
+
 # X-bogus算法
 async def get_xbogus(url: str, headers: dict | None = None) -> str:
     if not headers or 'user-agent' not in (k.lower() for k in headers):
@@ -57,17 +120,13 @@ async def get_sec_user_id(url: str, proxy_addr: str | None = None, headers: dict
         proxy_addr = utils.handle_proxy_addr(proxy_addr)
         async with httpx.AsyncClient(proxy=proxy_addr, timeout=15) as client:
             response = await client.get(url, headers=headers, follow_redirects=True)
-            redirect_url = response.url
-            if 'reflow/' in str(redirect_url):
-                match = re.search(r'sec_user_id=([\w_\-]+)&', str(redirect_url))
-                if match:
-                    sec_user_id = match.group(1)
-                    room_id = str(redirect_url).split('?')[0].rsplit('/', maxsplit=1)[1]
-                    return room_id, sec_user_id
-                else:
-                    raise RuntimeError("Could not find sec_user_id in the URL.")
-            else:
+            redirect_url = str(response.url)
+            room_id, sec_user_id = _extract_reflow_params(redirect_url)
+            if not room_id:
                 raise UnsupportedUrlError("The redirect URL does not contain 'reflow/'.")
+            if not sec_user_id:
+                raise RuntimeError("Could not find sec_user_id in the URL.")
+            return room_id, sec_user_id
     except UnsupportedUrlError as e:
         raise e
     except Exception as e:

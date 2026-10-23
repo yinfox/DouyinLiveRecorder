@@ -1,16 +1,22 @@
-version: '3.8'
-
 services:
   app:
-    image: ihmily/douyin-live-recorder:latest
+    build: .
+    image: y1nf0x/douyinliverecorder:latest
     environment:
       - TERM=xterm-256color
+      - MALLOC_ARENA_MAX=2
+      - MALLOC_TRIM_THRESHOLD_=65536
+      - WEBUI_HOST=0.0.0.0
+      - WEBUI_PORT=8080
+    init: true
     tty: true
     stdin_open: true
-    #build: .
+    ports:
+      - "8080:8080"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
       - ./backup_config:/app/backup_config
       - ./downloads:/app/downloads
     restart: always
+    stop_grace_period: 30s
